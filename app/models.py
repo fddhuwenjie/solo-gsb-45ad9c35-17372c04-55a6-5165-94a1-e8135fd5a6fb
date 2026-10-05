@@ -305,11 +305,46 @@ class RevocationEvent(BaseModel):
     created_at: datetime = Field(description="事件落库时间（UTC）")
 
 
+class RevocationImpactEntry(BaseModel):
+    """撤销影响清单条目：一笔被撤销事件追溯影响的成功核销。
+
+    撤销追溯到已完成访问之前（核销时间不早于 ``effective_at``、且早于撤销
+    事件写入时间）时，该次访问列入清单。单链核销与双链会签均纳入；一笔
+    会签只列一次，``side`` 注明受影响的是主授权侧还是复核侧。
+    """
+
+    redeemed_at: datetime = Field(description="该次访问的核销时间（UTC）")
+    access_request_key: str = Field(
+        description="该次访问（单链核销或会签）的 request_key"
+    )
+    chain_id: str = Field(description="受影响访问所在的链（即撤销所在链）")
+    token_id: str = Field(description="被核销的末端令牌（撤销目标或其后代）")
+    side: Literal["single", "primary", "review"] = Field(
+        description="single=单链核销；primary/review=会签的主授权侧/复核侧"
+    )
+
+
+class RevocationImpactList(BaseModel):
+    """按撤销 request_key 查询的影响清单（按核销时间及访问键排序）。"""
+
+    request_key: str = Field(description="撤销事件的 request_key")
+    chain_id: str = Field(description="撤销事件所在的链")
+    token_id: str = Field(description="被撤销的令牌")
+    effective_at: datetime = Field(description="撤销生效时间（UTC）")
+    impacts: list[RevocationImpactEntry] = Field(
+        description="受影响的成功核销；无命中时为空清单"
+    )
+
+
 class RevocationResult(BaseModel):
     replayed: bool
     event: RevocationEvent
     # 被撤销节点自身及其后代，按原链（根→叶）顺序排列
     affected_token_ids: list[str]
+    # 被本事件追溯影响的成功核销清单（随事件同事务保存；重放时原样返回）
+    affected_redemptions: list[RevocationImpactEntry] = Field(
+        default_factory=list
+    )
 
 
 class RedemptionEvent(BaseModel):

@@ -17,6 +17,7 @@ from .models import (
     IntegrityReport,
     RedemptionEvent,
     RevocationEvent,
+    RevocationImpactEntry,
 )
 
 SCHEMA = """
@@ -131,6 +132,23 @@ CREATE TABLE IF NOT EXISTS co_redemptions (
     UNIQUE (review_chain_id, review_token_id),
     FOREIGN KEY (primary_chain_id) REFERENCES chains (chain_id),
     FOREIGN KEY (review_chain_id) REFERENCES chains (chain_id)
+);
+
+-- 撤销影响清单：撤销事件写入时，在同一事务内快照“追溯到已完成访问之前”
+-- 所影响的成功核销（单链核销与会签均纳入，一笔会签只列一次）。
+-- 只追加、不可变；与撤销事件同事务落库——撤销失败（回滚）不会留下清单，
+-- 同键重放也不会重复写入。原核销记录（redemptions / co_redemptions）不改写。
+CREATE TABLE IF NOT EXISTS revocation_impacts (
+    id                 INTEGER PRIMARY KEY AUTOINCREMENT,
+    revocation_key     TEXT NOT NULL,
+    access_request_key TEXT NOT NULL,
+    chain_id           TEXT NOT NULL,
+    token_id           TEXT NOT NULL,
+    side               TEXT NOT NULL,
+    redeemed_at        TEXT NOT NULL,
+    created_at         TEXT NOT NULL,
+    UNIQUE (revocation_key, access_request_key, chain_id, token_id, side),
+    FOREIGN KEY (revocation_key) REFERENCES revocations (request_key)
 );
 """
 
@@ -757,4 +775,137 @@ def _co_redemption_from_row(row: sqlite3.Row) -> CoRedemptionEvent:
         evaluated_at=datetime.fromisoformat(row["evaluated_at"]),
         redeemed_at=datetime.fromisoformat(row["redeemed_at"]),
         created_at=datetime.fromisoformat(row["created_at"]),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 撤销影响清单（随撤销事件同事务保存；只追加、不可变）
+# --------------------------------------------------------------------------- #
+def find_redemptions_affected_by_revocation(
+    conn: sqlite3.Connection,
+    chain_id: str,
+    token_ids: Iterable[str],
+    effective_at: datetime,
+    written_at: datetime,
+) -> list[RevocationImpactEntry]:
+    """找出被一条撤销事件追溯影响的成功核销（单链核销与双链会签均纳入）。
+
+    命中条件（撤销追溯到已完成访问之前）：
+
+    - 核销时间不早于撤销生效时间（``redeemed_at >= effective_at``）；
+    - 核销早于本事件写入时间（``redeemed_at < written_at``，即撤销落库前
+      已完成的访问；此后发生的核销不属本事件的影响快照）；
+    - 被核销的末端令牌属于撤销目标或其后代（``token_ids`` 由调用方按链
+      结构算出）。
+
+    一笔会签只列一次：会签两侧分属不同链，而受影响令牌都在撤销所在链上，
+    因此至多一侧命中；命中侧注明 ``primary`` / ``review``。本函数只读，
+    不改写任一侧原核销记录。
+    """
+    ids = sorted(set(token_ids))
+    if not ids:
+        return []
+    id_set = set(ids)
+    placeholders = ", ".join("?" for _ in ids)
+    entries: list[RevocationImpactEntry] = []
+
+    # 单链核销：本链末端中属于撤销目标或其后代的成功核销
+    rows = conn.execute(
+        f"SELECT {_REDEMPTION_COLUMNS} FROM redemptions "
+        f"WHERE chain_id = ? AND token_id IN ({placeholders})",
+        (chain_id, *ids),
+    ).fetchall()
+    for row in rows:
+        event = _redemption_from_row(row)
+        if effective_at <= event.redeemed_at < written_at:
+            entries.append(
+                RevocationImpactEntry(
+                    redeemed_at=event.redeemed_at,
+                    access_request_key=event.request_key,
+                    chain_id=event.chain_id,
+                    token_id=event.token_id,
+                    side="single",
+                )
+            )
+
+    # 双链会签：任一侧末端命中即列出该笔会签（一笔只列一次）
+    co_rows = conn.execute(
+        f"SELECT {_CO_REDEMPTION_COLUMNS} FROM co_redemptions "
+        f"WHERE (primary_chain_id = ? AND primary_token_id IN ({placeholders})) "
+        f"OR (review_chain_id = ? AND review_token_id IN ({placeholders}))",
+        (chain_id, *ids, chain_id, *ids),
+    ).fetchall()
+    for row in co_rows:
+        co = _co_redemption_from_row(row)
+        if not (effective_at <= co.redeemed_at < written_at):
+            continue
+        if co.primary_chain_id == chain_id and co.primary_token_id in id_set:
+            side, token_id = "primary", co.primary_token_id
+        elif co.review_chain_id == chain_id and co.review_token_id in id_set:
+            side, token_id = "review", co.review_token_id
+        else:
+            continue
+        entries.append(
+            RevocationImpactEntry(
+                redeemed_at=co.redeemed_at,
+                access_request_key=co.request_key,
+                chain_id=chain_id,
+                token_id=token_id,
+                side=side,
+            )
+        )
+    return _sort_impacts(entries)
+
+
+def _sort_impacts(
+    entries: Iterable[RevocationImpactEntry],
+) -> list[RevocationImpactEntry]:
+    """按核销时间及访问 request_key 排序（datetime 精确比较）。"""
+    return sorted(entries, key=lambda e: (e.redeemed_at, e.access_request_key))
+
+
+def insert_revocation_impacts(
+    conn: sqlite3.Connection,
+    revocation_key: str,
+    entries: Iterable[RevocationImpactEntry],
+    created_at: datetime,
+) -> None:
+    """随撤销事件同事务保存影响清单；唯一约束兜底重放 / 并发重复写入。"""
+    conn.executemany(
+        "INSERT INTO revocation_impacts (revocation_key, access_request_key, "
+        "chain_id, token_id, side, redeemed_at, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?)",
+        [
+            (
+                revocation_key,
+                e.access_request_key,
+                e.chain_id,
+                e.token_id,
+                e.side,
+                e.redeemed_at.astimezone(timezone.utc).isoformat(),
+                created_at.astimezone(timezone.utc).isoformat(),
+            )
+            for e in entries
+        ],
+    )
+
+
+def load_revocation_impacts(
+    conn: sqlite3.Connection, request_key: str
+) -> list[RevocationImpactEntry]:
+    """按撤销 request_key 取出已保存的影响清单（按核销时间及访问键排序）。"""
+    rows = conn.execute(
+        "SELECT access_request_key, chain_id, token_id, side, redeemed_at "
+        "FROM revocation_impacts WHERE revocation_key = ?",
+        (request_key,),
+    ).fetchall()
+    return _sort_impacts(
+        RevocationImpactEntry(
+            redeemed_at=datetime.fromisoformat(r["redeemed_at"]),
+            access_request_key=r["access_request_key"],
+            chain_id=r["chain_id"],
+            token_id=r["token_id"],
+            side=r["side"],
+        )
+        for r in rows
     )

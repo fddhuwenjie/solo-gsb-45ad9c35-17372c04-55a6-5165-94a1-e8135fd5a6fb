@@ -23,7 +23,11 @@
    轮换前保存的链在链查询、只读求值与首次核销中继续按锁定代次的密钥重验，结论不变；
 10. **提交时未注册签发者的结论冻结** —— 提交时签发者未注册（`unknown_issuer`）的链，
    把“缺失密钥”这一事实随链持久化：事后注册该主体、甚至轮换到匹配旧签名的密钥，
-   链查询 / 重放 / 求值 / 首次核销都保持提交时的拒绝结论，永不翻转。
+   链查询 / 重放 / 求值 / 首次核销都保持提交时的拒绝结论，永不翻转；
+11. **撤销追溯影响清单** —— 撤销事件写入时，在同一 SQLite 事务中找出核销时间不早于
+   `effective_at`、早于事件写入时间，且末端令牌为撤销目标或其后代的成功核销，
+   随事件保存影响清单：单链核销与双链会签均纳入（一笔会签只列一次，注明受影响的
+   链和主授权 / 复核侧），不改写任一侧原核销记录；可按撤销 `request_key` 查询清单。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -327,17 +331,70 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations
     "reason": "运维安全事件：疑似密钥泄露",
     "request_key": "ops-revoke-2026-0001",
     "content_sha256": "…",
-    "created_at": "2026-10-01T09:30:00+00:00"
+    "created_at": "2026-10-01T14:00:00+00:00"
   },
-  "affected_token_ids": ["token-a", "token-b"]
+  "affected_token_ids": ["token-a", "token-b"],
+  "affected_redemptions": [
+    {
+      "redeemed_at": "2026-10-01T13:00:00+00:00",
+      "access_request_key": "access-redeem-2026-0002",
+      "chain_id": "demo-chain-0001",
+      "token_id": "token-b",
+      "side": "single"
+    }
+  ]
 }
 ```
 
 `affected_token_ids` 为被撤销节点**自身及其全部后代**，按原链根→叶顺序列出
 （上例中 `token-b` 是 `token-a` 的下游委托，故一并失效）。
 
+`affected_redemptions` 为**撤销追溯影响清单**：若撤销追溯到已完成访问之前，
+受影响的访问在此列出。入列条件（三者同时满足）：
+
+- 核销时间**不早于** `effective_at`（上例 `13:00 ≥ 12:00`，撤销追溯到了它）；
+- 核销时间**早于**本事件写入时间（`13:00 < 14:00`，即撤销落库前已完成的访问）；
+- 被核销的末端令牌是撤销目标或其后代（`token-b` 是 `token-a` 的后代）。
+
+清单随事件在**同一 SQLite 事务**中保存（单链核销与双链会签均纳入，详见下节）。
+
 撤销事件**只追加、不可变**：服务不提供修改或删除接口；数据库层以
 `request_key UNIQUE` 与 `(chain_id, token_id) UNIQUE` 双重约束兜底并发。
+影响清单同样只追加：撤销失败（404 / 409 / 写冲突）整体回滚、不留清单；
+同键同内容重放返回写入时保存的原清单，不重复写入。
+
+### `GET /api/v1/revocations/{request_key}/impacts`
+
+按撤销 `request_key` 查询其追溯影响的成功核销清单（单链核销与双链会签均纳入，
+一笔会签只列一次，`side` 为 `single` / `primary` / `review`）：
+
+```bash
+curl -sS http://localhost:8000/api/v1/revocations/ops-revoke-2026-0001/impacts
+```
+
+```json
+{
+  "request_key": "ops-revoke-2026-0001",
+  "chain_id": "demo-chain-0001",
+  "token_id": "token-a",
+  "effective_at": "2026-10-01T12:00:00+00:00",
+  "impacts": [
+    {
+      "redeemed_at": "2026-10-01T13:00:00+00:00",
+      "access_request_key": "access-redeem-2026-0002",
+      "chain_id": "demo-chain-0001",
+      "token_id": "token-b",
+      "side": "single"
+    }
+  ]
+}
+```
+
+- `200 OK`：返回清单，按**核销时间及访问 request_key** 排序；无命中时 `impacts` 为 `[]`；
+- `404 Not Found`：该 `request_key` 的撤销事件不存在。
+
+清单是事件写入时的快照（只读审计）：此后的核销不会补入，原链查询、只读求值及
+成功核销的重放结论均不受影响。
 
 ### `POST /api/v1/chains/{chain_id}/evaluate`
 
@@ -637,6 +694,105 @@ curl -sS http://localhost:8000/api/v1/chains/cosign-review-0001  | python3 -m js
 > （不在末端 `10.1.0.0/16` 内）会得到 `200` + `"redeemed": false` 与两份轨迹，
 > 两侧都未核销、`request_key` 未占用——改回合法 IP 后用同一把键重试即可成功。
 > 对应回归测试见 `tests/test_co_redemption.py`。
+
+---
+
+## 撤销追溯影响清单演练（可直接复制执行）
+
+下面是一套完整的 bash 演练：提交链 → 完成一次访问核销 → **追溯撤销**（生效时间
+早于刚才的核销）→ 撤销响应与查询 API 均列出受影响的访问 → 重放撤销不重复写入 →
+空清单与 404。假设服务已通过 `docker compose up --build` 启动在
+`http://localhost:8000`，命令在仓库根目录执行（签名复用 `app.security`，
+需本地 Python 3.10+ 与 `pip install -r requirements.txt`）：
+
+```bash
+# 签名助手：生成 root -> service-a -> service-b 的三级链（演示主体随容器自动播种）
+PYTHONPATH=. python3 - <<'PY' > /tmp/imp-chain.json
+import json, os
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+
+chain_id    = "imp-chain-0001"
+root_secret = os.environ.get("ROOT_HMAC_SECRET", "dev-root-secret-change-me")
+now = datetime.now(timezone.utc)
+nb = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+na = (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+
+def token(tid, parent, iss, sub, path, methods, secret):
+    t = {
+        "token_id": tid, "parent_id": parent, "chain_id": chain_id,
+        "issuer": iss, "subject": sub, "path_pattern": path,
+        "methods": methods, "not_before": nb, "not_after": na,
+        "allow_ip": None, "signature": "",
+    }
+    t["signature"] = compute_signature(t, secret)
+    return t
+
+print(json.dumps({
+    "chain_id": chain_id,
+    "tokens": [
+        token("imp-root", None, "root", "service-a",
+              "/files/**", ["GET", "POST"], root_secret),
+        token("imp-a", "imp-root", "service-a", "service-b",
+              "/files/reports/*", ["GET"], "demo-secret-service-a"),
+        token("imp-b", "imp-a", "service-b", "service-b",
+              "/files/reports/x", ["GET"], "demo-secret-service-b"),
+    ],
+}, ensure_ascii=False))
+PY
+
+# 1) 提交链
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/imp-chain.json
+# → 201，"integrity": {"allow": true, ...}
+
+# 2) 先完成一次访问核销（末端 imp-b）
+curl -sS -X POST http://localhost:8000/api/v1/chains/imp-chain-0001/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "imp-b", "request_key": "imp-access-0001",
+       "request_path": "/files/reports/x", "method": "GET"}'
+# → 201，"redeemed": true
+
+# 3) 追溯撤销中间令牌 imp-a：生效时间早于刚才的核销 -> 撤销追溯到已完成访问之前
+curl -sS -X POST http://localhost:8000/api/v1/chains/imp-chain-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "imp-a", "effective_at": "2026-01-01T00:00:00Z",
+       "reason": "运维安全事件：追溯至已完成访问之前",
+       "request_key": "imp-revoke-0001"}'
+# → 201，"affected_redemptions" 列出第 2 步的核销：
+#   [{"redeemed_at": ..., "access_request_key": "imp-access-0001",
+#     "chain_id": "imp-chain-0001", "token_id": "imp-b", "side": "single"}]
+
+# 4) 按撤销 request_key 查询影响清单
+curl -sS http://localhost:8000/api/v1/revocations/imp-revoke-0001/impacts \
+  | python3 -m json.tool
+# → 200，"impacts" 含同一条目（核销时间、访问 request_key、链、末端令牌、side）
+
+# 5) 同键同内容重放撤销：返回写入时保存的原清单，不重复写入
+curl -sS -X POST http://localhost:8000/api/v1/chains/imp-chain-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "imp-a", "effective_at": "2026-01-01T00:00:00Z",
+       "reason": "运维安全事件：追溯至已完成访问之前",
+       "request_key": "imp-revoke-0001"}'
+# → 200，"replayed": true，"affected_redemptions" 与首次相同（仍只有一条）
+
+# 6) 生效时间晚于核销时间的撤销：该访问不受追溯影响 -> 空清单
+curl -sS -X POST http://localhost:8000/api/v1/chains/imp-chain-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "imp-b", "effective_at": "2030-01-01T00:00:00Z",
+       "reason": "未来生效的撤销", "request_key": "imp-revoke-0002"}'
+# → 201，"affected_redemptions": []
+curl -sS http://localhost:8000/api/v1/revocations/imp-revoke-0002/impacts
+# → 200，"impacts": []
+
+# 7) 撤销事件不存在 -> 404
+curl -sS http://localhost:8000/api/v1/revocations/imp-revoke-9999/impacts
+# → 404 {"detail": "撤销事件 request_key='imp-revoke-9999' 不存在"}
+```
+
+> 双链会签同样纳入：对会签任一侧所在链追溯撤销，清单列出该笔会签一次，
+> `side` 注明 `primary`（主授权侧）或 `review`（复核侧）；原会签记录不改写。
+> 对应回归测试见 `tests/test_revocation_impacts.py`。
 
 ---
 
@@ -978,14 +1134,14 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销/双主体会签/密钥轮换
+│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销（含追溯影响清单）/一次性核销/双主体会签/密钥轮换
 │   ├── models.py      # Pydantic 模型与输入校验
 │   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语、内容指纹
 │   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎、链末端识别与轨迹
-│   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/核销持久化
+│   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/影响清单/核销持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：124 个用例（端到端 API、原语单测、撤销审计、一次性核销、双主体会签、密钥轮换、unknown_issuer 冻结）
+├── tests/             # pytest：140 个用例（端到端 API、原语单测、撤销审计与追溯影响清单、一次性核销、双主体会签、密钥轮换、unknown_issuer 冻结）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt

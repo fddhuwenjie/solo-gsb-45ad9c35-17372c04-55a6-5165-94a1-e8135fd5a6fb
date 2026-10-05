@@ -1,4 +1,4 @@
-"""FastAPI 应用：提交能力链、幂等重放、冲突检测、撤销审计、请求级判定、一次性核销、双主体会签与密钥轮换。"""
+"""FastAPI 应用：提交能力链、幂等重放、冲突检测、撤销审计（含追溯影响清单）、请求级判定、一次性核销、双主体会签与密钥轮换。"""
 from __future__ import annotations
 
 import json
@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from .database import (
+    find_redemptions_affected_by_revocation,
     get_conn,
     get_db,
     get_principal_key_row,
@@ -18,6 +19,7 @@ from .database import (
     insert_co_redemption,
     insert_redemption,
     insert_revocation,
+    insert_revocation_impacts,
     install_next_key_generation,
     load_chain_key_generations,
     load_chain_missing_issuers,
@@ -28,6 +30,7 @@ from .database import (
     load_redemptions,
     load_revocation_by_request_key,
     load_revocation_for_token,
+    load_revocation_impacts,
     load_revocations,
     load_submission,
     save_chain,
@@ -55,6 +58,7 @@ from .models import (
     RedeemRequest,
     RedeemResult,
     RevocationEvent,
+    RevocationImpactList,
     RevocationRequest,
     RevocationResult,
     SubmissionResult,
@@ -78,11 +82,12 @@ app = FastAPI(
     description=(
         "客户端提交根授权和以 parent_id 相连的委托令牌；服务验签、检测断链与环，"
         "并强制路径 / 方法 / 时间窗 / IP 网段只能逐级收窄。"
-        "支持按时间生效的不可变撤销事件、请求级判定、链末端令牌的一次性访问核销、"
+        "支持按时间生效的不可变撤销事件（事件写入时同事务保存追溯影响清单）、"
+        "请求级判定、链末端令牌的一次性访问核销、"
         "双主体会签核销（主授权链与复核链的末端在同一事务内同时核销或都不核销），"
         "以及按代次管理的签发主体 HMAC 密钥轮换（既有链按提交时锁定的代次重验）。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -746,11 +751,15 @@ def submit_revocation(
 ) -> JSONResponse:
     """提交（或重放）一条按时间生效的不可变撤销事件。
 
-    - 相同 ``request_key`` 且内容完全一致：幂等返回 200，``replayed=true``；
+    - 相同 ``request_key`` 且内容完全一致：幂等返回 200，``replayed=true``，
+      影响清单返回事件写入时保存的原清单（不重复写入）；
     - 相同 ``request_key`` 但目标 / 内容变化：返回 409 冲突；
     - 链或令牌不存在：404；目标令牌已有撤销事件（含不同 request_key）：409。
 
-    “确认令牌存在”与“追加撤销事件”在同一 SQLite 事务内完成。
+    “确认令牌存在”“追加撤销事件”与“保存影响清单”在同一 SQLite 事务内完成：
+    事件写入时找出核销时间不早于 ``effective_at``、早于事件写入时间，且末端
+    令牌为撤销目标或其后代的成功核销（单链核销与双链会签均纳入，一笔会签
+    只列一次），随事件一并落库；撤销失败（404 / 409 / 写冲突）不会留下清单。
     """
     content_hash = canonical_revocation_hash(
         chain_id,
@@ -764,10 +773,14 @@ def submit_revocation(
     existing_key = load_revocation_by_request_key(conn, payload.request_key)
     if existing_key is not None:
         if existing_key.content_sha256 == content_hash:
+            # 同键同内容：返回原事件与写入时保存的影响清单，不重复写入
             result = RevocationResult(
                 replayed=True,
                 event=existing_key,
                 affected_token_ids=_affected_ids(conn, chain_id, existing_key),
+                affected_redemptions=load_revocation_impacts(
+                    conn, existing_key.request_key
+                ),
             )
             return JSONResponse(
                 status_code=status.HTTP_200_OK,
@@ -839,14 +852,52 @@ def submit_revocation(
             detail=f"撤销事件与已有记录冲突: {exc}",
         )
 
+    # 同一事务内计算并保存影响清单：核销时间不早于 effective_at、早于事件
+    # 写入时间，且末端令牌为撤销目标或其后代的成功核销（单链核销与会签均
+    # 纳入，一笔会签只列一次）。清单与事件同事务落库——上方任何失败都会
+    # 整体回滚，撤销失败不会留下清单；原核销记录不改写。
+    affected_ids = _affected_ids(conn, chain_id, event)
+    impacts = find_redemptions_affected_by_revocation(
+        conn, chain_id, affected_ids, event.effective_at, event.created_at
+    )
+    insert_revocation_impacts(conn, event.request_key, impacts, event.created_at)
+
     result = RevocationResult(
         replayed=False,
         event=event,
-        affected_token_ids=_affected_ids(conn, chain_id, event),
+        affected_token_ids=affected_ids,
+        affected_redemptions=impacts,
     )
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
         content=result.model_dump(mode="json"),
+    )
+
+
+@app.get(
+    "/api/v1/revocations/{request_key}/impacts",
+    response_model=RevocationImpactList,
+)
+def get_revocation_impacts(
+    request_key: str, conn: sqlite3.Connection = Depends(get_db)
+) -> RevocationImpactList:
+    """按撤销 request_key 查询其追溯影响的成功核销清单。
+
+    返回核销时间、访问 request_key、链和末端令牌（会签注明主授权 / 复核侧），
+    按核销时间及访问键排序；无命中返回空清单，撤销事件不存在返回 404。
+    """
+    event = load_revocation_by_request_key(conn, request_key)
+    if event is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"撤销事件 request_key={request_key!r} 不存在",
+        )
+    return RevocationImpactList(
+        request_key=event.request_key,
+        chain_id=event.chain_id,
+        token_id=event.token_id,
+        effective_at=event.effective_at,
+        impacts=load_revocation_impacts(conn, request_key),
     )
 
 
