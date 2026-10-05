@@ -312,6 +312,37 @@ class RevocationResult(BaseModel):
     affected_token_ids: list[str]
 
 
+class RevocationImpact(BaseModel):
+    """撤销事件影响清单中的一项：一笔被追溯命中的成功访问核销。
+
+    清单在撤销事件写入的同一事务内计算并随事件保存，之后不可变；
+    只投影访问的核销时间、访问键、链与末端令牌，不改写原核销记录。
+    """
+
+    request_key: str = Field(description="受影响访问（核销）的 request_key")
+    chain_id: str = Field(description="受影响核销所在的链")
+    token_id: str = Field(description="被核销的末端令牌")
+    kind: Literal["single", "co"] = Field(
+        description="single=单链核销；co=双主体会签（一笔会签只列一次）"
+    )
+    side: Literal["primary", "review"] | None = Field(
+        default=None,
+        description="会签中受影响的一侧（primary=主授权 / review=复核）；单链核销为 null",
+    )
+    redeemed_at: datetime = Field(description="核销时间（UTC）")
+
+
+class RevocationImpactsResult(BaseModel):
+    """按撤销 request_key 查询到的影响清单（无命中时 impacts 为空列表）。"""
+
+    request_key: str = Field(description="撤销事件的 request_key")
+    chain_id: str = Field(description="撤销事件所在的链")
+    token_id: str = Field(description="被撤销的令牌")
+    effective_at: datetime = Field(description="撤销生效时间（UTC）")
+    # 按 (核销时间, 访问 request_key) 升序
+    impacts: list[RevocationImpact]
+
+
 class RedemptionEvent(BaseModel):
     """一次性访问核销记录（成功核销才落库；只追加、不可变）。"""
 

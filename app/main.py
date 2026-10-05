@@ -10,6 +10,7 @@ from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.responses import JSONResponse
 
 from .database import (
+    compute_revocation_impacts,
     get_conn,
     get_db,
     get_principal_key_row,
@@ -18,6 +19,7 @@ from .database import (
     insert_co_redemption,
     insert_redemption,
     insert_revocation,
+    insert_revocation_impacts,
     install_next_key_generation,
     load_chain_key_generations,
     load_chain_missing_issuers,
@@ -28,6 +30,7 @@ from .database import (
     load_redemptions,
     load_revocation_by_request_key,
     load_revocation_for_token,
+    load_revocation_impacts,
     load_revocations,
     load_submission,
     save_chain,
@@ -55,6 +58,7 @@ from .models import (
     RedeemRequest,
     RedeemResult,
     RevocationEvent,
+    RevocationImpactsResult,
     RevocationRequest,
     RevocationResult,
     SubmissionResult,
@@ -80,9 +84,11 @@ app = FastAPI(
         "并强制路径 / 方法 / 时间窗 / IP 网段只能逐级收窄。"
         "支持按时间生效的不可变撤销事件、请求级判定、链末端令牌的一次性访问核销、"
         "双主体会签核销（主授权链与复核链的末端在同一事务内同时核销或都不核销），"
-        "以及按代次管理的签发主体 HMAC 密钥轮换（既有链按提交时锁定的代次重验）。"
+        "撤销事件写入时同事务保存其追溯影响清单（被命中的成功核销，可按撤销 "
+        "request_key 查询），以及按代次管理的签发主体 HMAC 密钥轮换"
+        "（既有链按提交时锁定的代次重验）。"
     ),
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -750,7 +756,11 @@ def submit_revocation(
     - 相同 ``request_key`` 但目标 / 内容变化：返回 409 冲突；
     - 链或令牌不存在：404；目标令牌已有撤销事件（含不同 request_key）：409。
 
-    “确认令牌存在”与“追加撤销事件”在同一 SQLite 事务内完成。
+    “确认令牌存在”、“追加撤销事件”与“保存该事件的影响清单”在同一 SQLite
+    事务（``BEGIN IMMEDIATE``）内完成：事件写入时找出核销时间不早于
+    ``effective_at``、早于事件写入时间，且末端令牌为撤销目标或其后代的
+    成功核销（单链核销与双链会签均纳入），随事件一并落库；撤销失败时
+    整个事务回滚，不会留下影响清单。
     """
     content_hash = canonical_revocation_hash(
         chain_id,
@@ -759,6 +769,10 @@ def submit_revocation(
         payload.reason,
         payload.request_key,
     )
+
+    # 立即取写锁：影响清单的查找与事件写入同事务，并与并发核销
+    # （同样 BEGIN IMMEDIATE）串行化——清单恰好覆盖写入前已完成的访问
+    conn.execute("BEGIN IMMEDIATE")
 
     # 1) request_key 幂等 / 冲突（全局唯一键）
     existing_key = load_revocation_by_request_key(conn, payload.request_key)
@@ -830,10 +844,16 @@ def submit_revocation(
         content_sha256=content_hash,
         created_at=datetime.now(timezone.utc),
     )
+    # 事件写入时算出影响清单：核销时间不早于 effective_at、早于事件写入时间，
+    # 且末端令牌为撤销目标或其后代的成功核销（单链核销与会签均纳入）
+    affected_ids = _affected_ids(conn, chain_id, event)
+    impacts = compute_revocation_impacts(conn, event, affected_ids)
     try:
         insert_revocation(conn, event)
+        insert_revocation_impacts(conn, event, impacts)
     except sqlite3.IntegrityError as exc:
-        # 并发下唯一约束兜底（request_key 或 chain_id+token_id 抢占）
+        # 并发下唯一约束兜底（request_key 或 chain_id+token_id 抢占）；
+        # 失败整体回滚：事件与影响清单都不会留下
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"撤销事件与已有记录冲突: {exc}",
@@ -842,11 +862,40 @@ def submit_revocation(
     result = RevocationResult(
         replayed=False,
         event=event,
-        affected_token_ids=_affected_ids(conn, chain_id, event),
+        affected_token_ids=affected_ids,
     )
     return JSONResponse(
         status_code=status.HTTP_201_CREATED,
         content=result.model_dump(mode="json"),
+    )
+
+
+@app.get(
+    "/api/v1/revocations/{request_key}/impacts",
+    response_model=RevocationImpactsResult,
+)
+def get_revocation_impacts(
+    request_key: str, conn: sqlite3.Connection = Depends(get_db)
+) -> RevocationImpactsResult:
+    """按撤销 ``request_key`` 查询该事件写入时保存的影响清单。
+
+    清单在事件写入的同一事务内计算并随事件保存，之后不可变：核销时间不早于
+    ``effective_at``、早于事件写入时间，且末端令牌为撤销目标或其后代的成功
+    核销（单链核销与双链会签均纳入；一笔会签只列一次，注明受影响的链与
+    主授权 / 复核侧）。无命中返回空清单；撤销事件不存在返回 404。
+    """
+    event = load_revocation_by_request_key(conn, request_key)
+    if event is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"撤销事件 request_key={request_key!r} 不存在",
+        )
+    return RevocationImpactsResult(
+        request_key=event.request_key,
+        chain_id=event.chain_id,
+        token_id=event.token_id,
+        effective_at=event.effective_at,
+        impacts=load_revocation_impacts(conn, request_key),
     )
 
 

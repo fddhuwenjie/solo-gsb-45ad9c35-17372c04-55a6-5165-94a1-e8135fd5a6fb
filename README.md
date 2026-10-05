@@ -23,7 +23,12 @@
    轮换前保存的链在链查询、只读求值与首次核销中继续按锁定代次的密钥重验，结论不变；
 10. **提交时未注册签发者的结论冻结** —— 提交时签发者未注册（`unknown_issuer`）的链，
    把“缺失密钥”这一事实随链持久化：事后注册该主体、甚至轮换到匹配旧签名的密钥，
-   链查询 / 重放 / 求值 / 首次核销都保持提交时的拒绝结论，永不翻转。
+   链查询 / 重放 / 求值 / 首次核销都保持提交时的拒绝结论，永不翻转；
+11. **撤销影响清单** —— 撤销追溯到已完成访问之前时，列出受影响的访问：事件写入时在
+   **同一 SQLite 事务**内找出核销时间不早于 `effective_at`、早于事件写入时间，且末端
+   令牌为撤销目标或其后代的成功核销（单链核销与双链会签均纳入；一笔会签只列一次，
+   注明受影响的链与主授权 / 复核侧），随事件一并保存、之后不可变；可按撤销
+   `request_key` 查询清单，原核销记录不做任何改写。
 
 相同 `chain_id` 的重放**幂等**（返回 200 + `replayed=true`）；相同 `chain_id` 内容变化返回 **409 Conflict**。
 撤销与核销同样按 `request_key` 幂等：同键同内容重放原结果，同键换目标/内容返回 **409 Conflict**。
@@ -294,7 +299,9 @@ curl -sS -X POST http://localhost:8000/api/v1/principals/service-a/rotate-key \
 
 ### `POST /api/v1/chains/{chain_id}/revocations`
 
-在**同一 SQLite 事务**内确认 `token_id` 存在于该链，并追加一条不可变撤销事件。
+在**同一 SQLite 事务**（`BEGIN IMMEDIATE`）内确认 `token_id` 存在于该链、追加一条
+不可变撤销事件，并**同事务算出该事件的影响清单**（见
+`GET /api/v1/revocations/{request_key}/impacts`）随事件一并保存。
 
 ```bash
 curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations \
@@ -338,6 +345,124 @@ curl -sS -X POST http://localhost:8000/api/v1/chains/demo-chain-0001/revocations
 
 撤销事件**只追加、不可变**：服务不提供修改或删除接口；数据库层以
 `request_key UNIQUE` 与 `(chain_id, token_id) UNIQUE` 双重约束兜底并发。
+
+### `GET /api/v1/revocations/{request_key}/impacts`
+
+按撤销 `request_key` 查询该事件写入时保存的**影响清单**——撤销追溯到已完成访问
+之前时，哪些成功核销被命中。清单在事件写入的**同一 SQLite 事务**内计算并随事件
+保存，之后不可变，命中条件：
+
+- 核销时间 `redeemed_at` 不早于撤销 `effective_at`，且早于事件写入时间
+  （`created_at`）——即访问完成时撤销尚未登记，但生效时间已覆盖该访问；
+- 被核销的**末端令牌**是撤销目标或其后代（与响应中的 `affected_token_ids` 同集合）；
+- **单链核销与双链会签均纳入**：一笔会签只列一次，以 `kind="co"` 与
+  `side`（`primary` 主授权 / `review` 复核）注明受影响的链与侧；单链核销为
+  `kind="single"`、`side=null`；
+- 清单只是原核销记录的投影：**不改写** `redemptions` / 会签记录，链查询、求值与
+  成功核销的同键重放结论保持原样。
+
+```bash
+curl -sS http://localhost:8000/api/v1/revocations/ops-revoke-2026-0001/impacts
+```
+
+```json
+{
+  "request_key": "ops-revoke-2026-0001",
+  "chain_id": "demo-chain-0001",
+  "token_id": "token-a",
+  "effective_at": "2026-10-01T12:00:00+00:00",
+  "impacts": [
+    {
+      "request_key": "access-redeem-2026-0001",
+      "chain_id": "demo-chain-0001",
+      "token_id": "token-b",
+      "kind": "single",
+      "side": null,
+      "redeemed_at": "2026-10-01T12:30:00+00:00"
+    }
+  ]
+}
+```
+
+- `200 OK`：`impacts` 按（核销时间, 访问 `request_key`）升序；无命中返回空清单 `[]`；
+- `404 Not Found`：该 `request_key` 的撤销事件不存在（含撤销失败未落库的情形——
+  撤销失败不会留下清单）；
+- 同键同内容的撤销重放（`200`、`replayed=true`）不重复写入清单。
+
+下面是一套**可直接复制执行**的演练（前提：服务运行在 `http://localhost:8000`，
+仓库根目录，本地 Python 3.10+；签名复用 `app.security`）：
+
+```bash
+# 签名助手：生成 root -> service-a -> service-b 的三级链（时间窗覆盖当前时刻）
+PYTHONPATH=. python3 - <<'PY' > /tmp/impact-chain.json
+import json
+from datetime import datetime, timedelta, timezone
+from app.security import compute_signature
+
+chain_id = "impact-demo-0001"
+root_secret = "dev-root-secret-change-me"   # 对应 compose 中 ROOT_HMAC_SECRET
+now = datetime.now(timezone.utc)
+nb = (now - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
+na = (now + timedelta(hours=6)).isoformat().replace("+00:00", "Z")
+
+def token(tid, parent, iss, sub, path, methods, secret):
+    t = {
+        "token_id": tid, "parent_id": parent, "chain_id": chain_id,
+        "issuer": iss, "subject": sub, "path_pattern": path,
+        "methods": methods, "not_before": nb, "not_after": na,
+        "allow_ip": None, "signature": "",
+    }
+    t["signature"] = compute_signature(t, secret)
+    return t
+
+print(json.dumps({
+    "chain_id": chain_id,
+    "tokens": [
+        token("imp-root", None, "root", "service-a",
+              "/files/**", ["GET", "POST"], root_secret),
+        token("imp-a", "imp-root", "service-a", "service-b",
+              "/files/reports/*", ["GET"], "demo-secret-service-a"),
+        token("imp-b", "imp-a", "service-b", "service-b",
+              "/files/reports/q1.pdf", ["GET"], "demo-secret-service-b"),
+    ],
+}, ensure_ascii=False))
+PY
+
+# 1) 提交链
+curl -sS -X POST http://localhost:8000/api/v1/chains \
+  -H 'Content-Type: application/json' --data @/tmp/impact-chain.json
+# → 201，"integrity": {"allow": true, ...}
+
+# 2) 对链末端做一次性访问核销（判定时间 = 服务端接收时刻）
+curl -sS -X POST http://localhost:8000/api/v1/chains/impact-demo-0001/redeem \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "imp-b", "request_key": "impact-access-0001",
+       "request_path": "/files/reports/q1.pdf", "method": "GET"}'
+# → 201，"redeemed": true
+
+# 3) 追加一条生效时间早于该次访问的撤销（追溯到已完成访问之前）
+curl -sS -X POST http://localhost:8000/api/v1/chains/impact-demo-0001/revocations \
+  -H 'Content-Type: application/json' \
+  -d '{"token_id": "imp-a", "effective_at": "2026-01-01T00:00:00Z",
+       "reason": "运维安全事件：疑似密钥泄露", "request_key": "impact-revoke-0001"}'
+# → 201，"affected_token_ids": ["imp-a", "imp-b"]
+
+# 4) 查询该撤销事件的影响清单：第 2 步的访问被列出
+curl -sS http://localhost:8000/api/v1/revocations/impact-revoke-0001/impacts
+# → 200，"impacts": [{"request_key": "impact-access-0001",
+#      "chain_id": "impact-demo-0001", "token_id": "imp-b",
+#      "kind": "single", "side": null, "redeemed_at": "..."}]
+
+# 5) 不存在的撤销 request_key → 404
+curl -sS -o /dev/null -w '%{http_code}\n' \
+  http://localhost:8000/api/v1/revocations/no-such-key/impacts
+# → 404
+```
+
+> 若第 3 步的 `effective_at` 改为晚于核销时间的未来时刻，第 4 步将返回空清单
+> `"impacts": []`——生效前的访问不被追溯。会签被命中时条目为
+> `"kind": "co"` 且 `"side": "primary"` 或 `"review"`（一笔会签只列一次）。
+> 对应回归测试见 `tests/test_revocation_impacts.py`。
 
 ### `POST /api/v1/chains/{chain_id}/evaluate`
 
@@ -978,14 +1103,14 @@ token["signature"] = compute_signature(token, issuer_secret)
 ```
 .
 ├── app/
-│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/一次性核销/双主体会签/密钥轮换
+│   ├── main.py        # FastAPI 路由：提交/重放/冲突/查询/求值/撤销/影响清单/一次性核销/双主体会签/密钥轮换
 │   ├── models.py      # Pydantic 模型与输入校验
 │   ├── security.py    # 规范化 JSON、HMAC、glob、收窄原语、内容指纹
 │   ├── engine.py      # 结构/签名/签发者/收窄/请求级验证引擎、链末端识别与轨迹
-│   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/核销持久化
+│   ├── database.py    # SQLite 初始化与迁移、主体密钥代次/链/撤销/影响清单/核销持久化
 │   └── config.py      # 环境变量配置
 ├── scripts/demo_chain.py
-├── tests/             # pytest：124 个用例（端到端 API、原语单测、撤销审计、一次性核销、双主体会签、密钥轮换、unknown_issuer 冻结）
+├── tests/             # pytest：139 个用例（端到端 API、原语单测、撤销审计、撤销影响清单、一次性核销、双主体会签、密钥轮换、unknown_issuer 冻结）
 ├── Dockerfile
 ├── docker-compose.yml
 └── requirements.txt
